@@ -22,20 +22,41 @@ spark = SparkSession.builder.appName("Databricks_Optimization_Reference").getOrC
 # 1) Broadcast join
 # -----------------------------------------------------------------------------
 # What it is:
-#   If one side of a join is small, send that small table to all executors.
-#   This avoids a large shuffle and speeds up joins.
+#   Spark sends the small side of a join to the executors that run the join.
+#   Each executor has a local broadcast copy; tasks on that executor can reuse it.
+#   Spark does not make a separate full copy for every task.
+#
+# How it can improve performance:
+#   Without broadcast, Spark may shuffle both sides so matching keys meet.
+#   With broadcast, each task joins its local large-data partition with the local
+#   small-table copy, often avoiding the join shuffle.
+#   Even on one worker node, this may avoid repartitioning and shuffle I/O, though
+#   the benefit is often greater across multiple worker nodes.
 #
 # When to use:
-#   Fact table is large, dimension table is small.
-#   Example: orders (millions of rows) joined with customers (few thousand rows).
+#   One side is small enough to fit comfortably in memory on each executor.
+#   Example: a large orders table joined to a small customer dimension.
+#   Select only the needed columns (and filter first) to keep the broadcast small.
 #
 # Difference from others:
 #   Not a write optimization. It is a join optimization.
 #   It helps before or during the join, not after writing.
+#   It is not the same as df.cache()/persist(): a broadcast is built for a join
+#   execution and is not a promise to cache the DataFrame for future queries.
+#
+# Lifetime and reuse:
+#   The broadcast is distributed to participating executors for the join. Tasks
+#   on each executor reuse its local copy. Spark manages cleanup; do not assume
+#   the copy stays available for a separate later query. A later join execution
+#   may need to broadcast the data again.
+#   Broadcast copies are per executor, not one shared memory copy per worker node.
 #
 # Default enable:
-#   There is no default table property for broadcast join.
-#   It is usually controlled at runtime by using F.broadcast(...).
+#   There is no per-table broadcast setting. Spark may choose broadcast
+#   automatically using size statistics and spark.sql.autoBroadcastJoinThreshold.
+#   Use F.broadcast(...) as a hint for a specific join when appropriate.
+#   Check the plan with joined_df.explain("formatted"); an explicit hint does not
+#   make an oversized table safe to broadcast.
 #
 # Runtime example:
 customer_dim = spark.createDataFrame(
@@ -58,9 +79,22 @@ orders_fact = spark.createDataFrame(
     ["order_id", "customer_id", "amount"],
 )
 
-broadcast_join_df = orders_fact.join(F.broadcast(customer_dim), "customer_id", "left")
+# Broadcast only the columns needed by this join. For this tiny example, the
+# complete customer dimension is small; production data needs size judgment.
+small_customer_dim = customer_dim.select("customer_id", "customer_name", "region")
+broadcast_join_df = orders_fact.join(F.broadcast(small_customer_dim), "customer_id", "left")
 print("\n=== Broadcast join example ===")
 broadcast_join_df.show()
+
+# A left_semi join keeps rows from orders_fact whose customer_id exists in the broadcast DataFrame.
+# It does not add columns from customer_ids, so this is ideal for filtering by membership.
+customer_ids = customer_dim.select("customer_id").distinct()
+
+orders_for_known_customers = orders_fact.join(
+    F.broadcast(customer_ids),
+    on="customer_id",
+    how="left_semi"
+)
 
 # -----------------------------------------------------------------------------
 # 2) Repartition
